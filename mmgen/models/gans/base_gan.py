@@ -1,3 +1,4 @@
+# Copyright (c) OpenMMLab. All rights reserved.
 from abc import ABCMeta, abstractmethod
 from collections import OrderedDict
 
@@ -85,7 +86,6 @@ class BaseGAN(nn.Module, metaclass=ABCMeta):
                 if loss_ is None:
                     continue
 
-                # mmcv.print_log(f'get loss for {loss_module.name()}')
                 # the `loss_name()` function return name as 'loss_xxx'
                 if loss_module.loss_name() in losses_dict:
                     losses_dict[loss_module.loss_name(

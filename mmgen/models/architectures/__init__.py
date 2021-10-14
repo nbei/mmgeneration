@@ -1,4 +1,6 @@
-from .biggan import BigGANGenerator
+# Copyright (c) OpenMMLab. All rights reserved.
+from .biggan import (BigGANDeepDiscriminator, BigGANDeepGenerator,
+                     BigGANDiscriminator, BigGANGenerator, SNConvModule)
 from .cyclegan import ResnetGenerator
 from .dcgan import DCGANDiscriminator, DCGANGenerator
 from .fid_inception import InceptionV3
@@ -32,5 +34,6 @@ __all__ = [
     'generation_init_weights', 'PatchDiscriminator', 'ResnetGenerator',
     'PerceptualLoss', 'WGANGPDiscriminator', 'WGANGPGenerator',
     'LSGANDiscriminator', 'LSGANGenerator', 'ProjDiscriminator',
-    'SNGANGenerator', 'BigGANGenerator', 'ADAStyleGAN2Disc'
+    'SNGANGenerator', 'BigGANGenerator', 'SNConvModule', 'BigGANDiscriminator',
+    'BigGANDeepGenerator', 'BigGANDeepDiscriminator', 'ADAStyleGAN2Disc'
 ]

@@ -1,3 +1,4 @@
+# Copyright (c) OpenMMLab. All rights reserved.
 from copy import deepcopy
 
 import numpy as np
@@ -8,6 +9,7 @@ from mmcv.cnn import (ConvModule, build_activation_layer, constant_init,
 from mmcv.runner import load_checkpoint
 from mmcv.runner.checkpoint import _load_checkpoint_with_prefix
 from mmcv.utils import is_list_of
+from torch.nn.init import xavier_uniform_
 from torch.nn.utils import spectral_norm
 
 from mmgen.models.builder import MODULES, build_module
@@ -82,8 +84,15 @@ class SNGANGenerator(nn.Module):
             Synchronized ones when Distributed training is on. Defualt to True.
         with_spectral_norm (bool, optional): Whether use spectral norm for
             conv blocks or not. Default to False.
+        with_embedding_spectral_norm (bool, optional): Whether use spectral
+            norm for embedding layers in normalization blocks or not. If not
+            specified (set as ``None``), ``with_embedding_spectral_norm`` would
+            be set as the same value as ``with_spectral_norm``.
+            Default to None.
         norm_eps (float, optional): eps for Normalization layers (both
-            conditional and non-conditional ones). Default to 1e-4.
+            conditional and non-conditional ones). Default to `1e-4`.
+        sn_eps (float, optional): eps for spectral normalization operation.
+            Default to `1e-12`.
         init_cfg (string, optional): Config for weight initialization.
             Default to ``dict(type='BigGAN')``.
         pretrained (str | dict, optional): Path for the pretrained model or
@@ -114,7 +123,9 @@ class SNGANGenerator(nn.Module):
                  use_cbn=True,
                  auto_sync_bn=True,
                  with_spectral_norm=False,
+                 with_embedding_spectral_norm=None,
                  norm_eps=1e-4,
+                 sn_eps=1e-12,
                  init_cfg=dict(type='BigGAN'),
                  pretrained=None):
 
@@ -133,8 +144,15 @@ class SNGANGenerator(nn.Module):
         self.blocks_cfg.setdefault('use_cbn', use_cbn)
         self.blocks_cfg.setdefault('auto_sync_bn', auto_sync_bn)
         self.blocks_cfg.setdefault('with_spectral_norm', with_spectral_norm)
+
+        # set `norm_spectral_norm` as `with_spectral_norm` if not defined
+        with_embedding_spectral_norm = with_embedding_spectral_norm \
+            if with_embedding_spectral_norm is not None else with_spectral_norm
+        self.blocks_cfg.setdefault('with_embedding_spectral_norm',
+                                   with_embedding_spectral_norm)
         self.blocks_cfg.setdefault('init_cfg', init_cfg)
         self.blocks_cfg.setdefault('norm_eps', norm_eps)
+        self.blocks_cfg.setdefault('sn_eps', sn_eps)
 
         channels_cfg = deepcopy(self._defualt_channels_cfg) \
             if channels_cfg is None else deepcopy(channels_cfg)
@@ -221,10 +239,10 @@ class SNGANGenerator(nn.Module):
                 returned in a dict with ``fake_img``. Defaults to False.
 
         Returns:
-            torch.Tensor | dict: If not ``return_noise`` and not
-            ``return_label``, only the output image will be returned.
-            Otherwise, the dict would contains ``fake_image``, ``noise_batch``
-            and ``label_batch`` would be returned.
+            torch.Tensor | dict: If not ``return_noise``, only the output
+                image will be returned. Otherwise, a dict contains
+                ``fake_image``, ``noise_batch`` and ``label_batch``
+                would be returned.
         """
         if isinstance(noise, torch.Tensor):
             assert noise.shape[1] == self.noise_size
@@ -278,7 +296,7 @@ class SNGANGenerator(nn.Module):
         return out_img
 
     def init_weights(self, pretrained=None, strict=True):
-        """Init weights for SNGAN-Proj and SAGAN. If ``pretrained=None`` and
+        """Init weights for SNGAN-Proj and SAGAN. If ``pretrained=None``,
         weight initialization would follow the ``INIT_TYPE`` in
         ``init_cfg=dict(type=INIT_TYPE)``.
 
@@ -291,10 +309,10 @@ class SNGANGenerator(nn.Module):
         initialization method in official tensorflow's implementation
         (https://github.com/brain-research/self-attention-gan).
 
-        Besides the reimplementation of the official code, we provide BigGAN's
-        and Pytorch GAN Studio's style initialization
-        (``INIT_TYPE.upper() == BIGGAN``), refers to
-        https://github.com/ajbrock/BigGAN-PyTorch and
+        Besides the reimplementation of the official code's initialization, we
+        provide BigGAN's and Pytorch-StudioGAN's style initialization
+        (``INIT_TYPE.upper() == BIGGAN`` and ``INIT_TYPE.upper() == STUDIO``).
+        Please refer to https://github.com/ajbrock/BigGAN-PyTorch and
         https://github.com/POSTECH-CVLab/PyTorch-StudioGAN.
 
         Args:
@@ -317,18 +335,48 @@ class SNGANGenerator(nn.Module):
                                                       map_location)
             self.load_state_dict(state_dict, strict=strict)
         elif pretrained is None:
-            if self.init_type.upper() in 'BIGGAN':
-                # BigGAN and Pytorch-GAN Studio's initialization style
+            if self.init_type.upper() in 'STUDIO':
+                # initialization method from Pytorch-StudioGAN
+                #   * weight: orthogonal_init gain=1
+                #   * bias  : 0
                 for m in self.modules():
                     if isinstance(m, (nn.Conv2d, nn.Linear, nn.Embedding)):
                         nn.init.orthogonal_(m.weight)
-            elif self.init_type.upper() == 'SAGAN':
-                # initialization method from official tensorflow code
+                        if hasattr(m, 'bias') and m.bias is not None:
+                            m.bias.data.fill_(0.)
+            elif self.init_type.upper() == 'BIGGAN':
+                # initialization method from BigGAN-pytorch
+                #   * weight: xavier_init gain=1
+                #   * bias  : default
                 for n, m in self.named_modules():
                     if isinstance(m, (nn.Conv2d, nn.Linear, nn.Embedding)):
+                        xavier_uniform_(m.weight, gain=1)
+            elif self.init_type.upper() == 'SAGAN':
+                # initialization method from official tensorflow code
+                #   * weight          : xavier_init gain=1
+                #   * bias            : 0
+                #   * weight_embedding: 1
+                #   * bias_embedding  : 0
+                for n, m in self.named_modules():
+                    if isinstance(m, (nn.Conv2d, nn.Linear)):
                         xavier_init(m, gain=1, distribution='uniform')
+                    if isinstance(m, nn.Embedding):
+                        # To be noted that here we initialize the embedding
+                        # layer in cBN with specific prefix. If you implement
+                        # your own cBN and want to use this initialization
+                        # method, please make sure the embedding layers in
+                        # your implementation have the same prefix as ours.
+                        if 'weight' in n:
+                            constant_init(m, 1)
+                        if 'bias' in n:
+                            constant_init(m, 0)
             elif self.init_type.upper() in ['SNGAN', 'SNGAN-PROJ', 'GAN-PROJ']:
                 # initialization method from the official chainer code
+                #   * conv.weight     : xavier_init gain=sqrt(2)
+                #   * shortcut.weight : xavier_init gain=1
+                #   * bias            : 0
+                #   * weight_embedding: 1
+                #   * bias_embedding  : 0
                 for n, m in self.named_modules():
                     if isinstance(m, nn.Conv2d):
                         if 'shortcut' in n or 'to_rgb' in n:
@@ -465,6 +513,7 @@ class ProjDiscriminator(nn.Module):
                  blocks_cfg=dict(type='SNGANDiscResBlock'),
                  act_cfg=dict(type='ReLU'),
                  with_spectral_norm=True,
+                 sn_eps=1e-12,
                  init_cfg=dict(type='BigGAN'),
                  pretrained=None):
 
@@ -482,6 +531,7 @@ class ProjDiscriminator(nn.Module):
         self.blocks_cfg = deepcopy(blocks_cfg)
         self.blocks_cfg.setdefault('act_cfg', act_cfg)
         self.blocks_cfg.setdefault('with_spectral_norm', with_spectral_norm)
+        self.blocks_cfg.setdefault('sn_eps', sn_eps)
         self.blocks_cfg.setdefault('init_cfg', init_cfg)
 
         channels_cfg = deepcopy(self._defualt_channels_cfg) \
@@ -556,9 +606,8 @@ class ProjDiscriminator(nn.Module):
                 attn_cfg_['in_channels'] = factor_output * base_channels
                 self.conv_blocks.append(build_module(attn_cfg_))
 
-        decision_bias = self.init_type == 'BigGAN'
-        self.decision = nn.Linear(
-            factor_output * base_channels, 1, bias=decision_bias)
+        self.decision = nn.Linear(factor_output * base_channels, 1)
+
         if with_spectral_norm:
             self.decision = spectral_norm(self.decision)
 
@@ -614,10 +663,10 @@ class ProjDiscriminator(nn.Module):
         (https://github.com/brain-research/self-attention-gan).
 
         Besides the reimplementation of the official code's initialization, we
-        provide BigGAN's and Pytorch GAN Studio's style initialization
-        (``INIT_TYPE.upper() == BIGGAN``).
-        (https://github.com/ajbrock/BigGAN-PyTorch and
-        https://github.com/POSTECH-CVLab/PyTorch-StudioGAN)
+        provide BigGAN's and Pytorch-StudioGAN's style initialization
+        (``INIT_TYPE.upper() == BIGGAN`` and ``INIT_TYPE.upper() == STUDIO``).
+        Please refer to https://github.com/ajbrock/BigGAN-PyTorch and
+        https://github.com/POSTECH-CVLab/PyTorch-StudioGAN.
 
         Args:
             pretrained (str | dict, optional): Path for the pretrained model or
@@ -639,17 +688,35 @@ class ProjDiscriminator(nn.Module):
                                                       map_location)
             self.load_state_dict(state_dict, strict=strict)
         elif pretrained is None:
-            if self.init_type.upper() == 'BIGGAN':
+            if self.init_type.upper() == 'STUDIO':
+                # initialization method from Pytorch-StudioGAN
+                #   * weight: orthogonal_init gain=1
+                #   * bias  : 0
                 for m in self.modules():
                     if isinstance(m, (nn.Conv2d, nn.Linear, nn.Embedding)):
-                        nn.init.orthogonal_(m.weight)
+                        nn.init.orthogonal_(m.weight, gain=1)
+                        if hasattr(m, 'bias') and m.bias is not None:
+                            m.bias.data.fill_(0.)
+            elif self.init_type.upper() == 'BIGGAN':
+                # initialization method from BigGAN-pytorch
+                #   * weight: xavier_init gain=1
+                #   * bias  : default
+                for m in self.modules():
+                    if isinstance(m, (nn.Conv2d, nn.Linear, nn.Embedding)):
+                        xavier_uniform_(m.weight, gain=1)
             elif self.init_type.upper() == 'SAGAN':
                 # initialization method from official tensorflow code
+                #   * weight: xavier_init gain=1
+                #   * bias  : 0
                 for m in self.modules():
                     if isinstance(m, (nn.Conv2d, nn.Linear, nn.Embedding)):
                         xavier_init(m, gain=1, distribution='uniform')
             elif self.init_type.upper() in ['SNGAN', 'SNGAN-PROJ', 'GAN-PROJ']:
                 # initialization method from the official chainer code
+                #   * embedding.weight: xavier_init gain=1
+                #   * conv.weight     : xavier_init gain=sqrt(2)
+                #   * shortcut.weight : xavier_init gain=1
+                #   * bias            : 0
                 for n, m in self.named_modules():
                     if isinstance(m, nn.Conv2d):
                         if 'shortcut' in n:

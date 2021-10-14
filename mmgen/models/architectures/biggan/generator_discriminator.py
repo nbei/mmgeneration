@@ -1,3 +1,4 @@
+# Copyright (c) OpenMMLab. All rights reserved.
 from copy import deepcopy
 
 import mmcv
@@ -17,7 +18,8 @@ from .modules import SelfAttentionBlock, SNConvModule
 
 @MODULES.register_module()
 class BigGANGenerator(nn.Module):
-    """BigGAN Generator.
+    """BigGAN Generator. The implementation refers to
+    https://github.com/ajbrock/BigGAN-PyTorch/blob/master/BigGAN.py # noqa.
 
     In BigGAN, we use a SAGAN-based architecture composing of an self-attention
     block and number of convolutional residual blocks with spectral
@@ -26,12 +28,28 @@ class BigGANGenerator(nn.Module):
     More details can be found in: Large Scale GAN Training for High Fidelity
     Natural Image Synthesis (ICLR2019).
 
+    The design of the model structure is highly corresponding to the output
+    resolution. For the original BigGAN's generator, you can set ``output_scale``
+    as you need and use the default value of ``arch_cfg`` and ``blocks_cfg``.
+    If you want to customize the model, you can set the arguments in this way:
+
+    ``arch_cfg``: Config for the architecture of this generator. You can refer
+    the ``_default_arch_cfgs`` in the ``_get_default_arch_cfg`` function to see
+    the format of the ``arch_cfg``. Basically, you need to provide information
+    of each block such as the numbers of input and output channels, whether to
+    perform upsampling, etc.
+
+    ``blocks_cfg``: Config for the convolution block. You can replace the block
+    type to your registered customized block and adjust block params here.
+    However, you should notice that some params are shared among these blocks
+    like ``act_cfg``, ``with_spectral_norm``, ``sn_eps``, etc.
+
     Args:
         output_scale (int): Output scale for the generated image.
         noise_size (int, optional): Size of the input noise vector. Defaults
             to 120.
         num_classes (int, optional): The number of conditional classes. If set
-            to 0, this init function will return an unconditional model.
+            to 0, this model will be degraded to an unconditional model.
             Defaults to 0.
         out_channels (int, optional): Number of channels in output images.
             Defaults to 3.
@@ -52,8 +70,6 @@ class BigGANGenerator(nn.Module):
             Defaults to True.
         act_cfg (dict, optional): Config for the activation layer. Defaults to
             dict(type='ReLU').
-        conv_cfg (dict, optional): Config for the convolution module used in
-            this generator. Defaults to dict(type='Conv2d').
         upsample_cfg (dict, optional): Config for the upsampling operation.
             Defaults to dict(type='nearest', scale_factor=2).
         with_spectral_norm (bool, optional): Whether to use spectral
@@ -70,6 +86,10 @@ class BigGANGenerator(nn.Module):
             dict containing information for pretained models whose necessary
             key is 'ckpt_path'. Besides, you can also provide 'prefix' to load
             the generator part from the whole state dict. Defaults to None.
+        rgb2bgr (bool, optional): Whether to reformat the output channels
+                with order `bgr`. We provide several pre-trained BigGAN
+                weights whose output channels order is `rgb`. You can set
+                this argument to True to use the weights.
     """
 
     def __init__(self,
@@ -85,14 +105,14 @@ class BigGANGenerator(nn.Module):
                  init_type='ortho',
                  split_noise=True,
                  act_cfg=dict(type='ReLU'),
-                 conv_cfg=dict(type='Conv2d'),
                  upsample_cfg=dict(type='nearest', scale_factor=2),
                  with_spectral_norm=True,
                  auto_sync_bn=True,
                  blocks_cfg=dict(type='BigGANGenResBlock'),
                  arch_cfg=None,
                  out_norm_cfg=dict(type='BN'),
-                 pretrained=None):
+                 pretrained=None,
+                 rgb2bgr=False):
         super().__init__()
         self.noise_size = noise_size
         self.num_classes = num_classes
@@ -105,6 +125,7 @@ class BigGANGenerator(nn.Module):
         self.split_noise = split_noise
         self.blocks_cfg = deepcopy(blocks_cfg)
         self.upsample_cfg = deepcopy(upsample_cfg)
+        self.rgb2bgr = rgb2bgr
 
         # Validity Check
         # If 'num_classes' equals to zero, we shall set 'with_shared_embedding'
@@ -155,7 +176,6 @@ class BigGANGenerator(nn.Module):
             dict(
                 dim_after_concat=self.dim_after_concat,
                 act_cfg=act_cfg,
-                conv_cfg=conv_cfg,
                 sn_eps=sn_eps,
                 input_is_label=(num_classes > 0)
                 and (not with_shared_embedding),
@@ -184,7 +204,6 @@ class BigGANGenerator(nn.Module):
             out_channels,
             kernel_size=3,
             padding=1,
-            conv_cfg=conv_cfg,
             with_spectral_norm=with_spectral_norm,
             spectral_norm_cfg=dict(eps=sn_eps),
             act_cfg=act_cfg,
@@ -244,7 +263,13 @@ class BigGANGenerator(nn.Module):
 
         return _default_arch_cfgs[str(output_scale)]
 
-    def forward(self, noise, label=None, num_batches=0, return_noise=False):
+    def forward(self,
+                noise,
+                label=None,
+                num_batches=0,
+                return_noise=False,
+                truncation=-1.0,
+                use_outside_embedding=False):
         """Forward function.
 
         Args:
@@ -262,6 +287,14 @@ class BigGANGenerator(nn.Module):
             return_noise (bool, optional): If True, ``noise_batch`` and
                 ``label`` will be returned in a dict with ``fake_img``.
                 Defaults to False.
+            truncation (float, optional): Truncation factor. Give value not
+                less than 0., the truncation trick will be adopted.
+                Otherwise, the truncation trick will not be adopted.
+                Defaults to -1..
+            use_outside_embedding (bool, optional): Whether to use outside
+                embedding or use `shared_embedding`. Set to `True` if
+                embedding has already be performed outside this function.
+                Default to False.
 
         Returns:
             torch.Tensor | dict: If not ``return_noise``, only the output image
@@ -283,12 +316,19 @@ class BigGANGenerator(nn.Module):
             assert num_batches > 0
             noise_batch = torch.randn((num_batches, self.noise_size))
 
+        # perform truncation
+        if truncation >= 0.0:
+            noise_batch = torch.clamp(noise_batch, -1. * truncation,
+                                      1. * truncation)
+
         if self.num_classes == 0:
             label_batch = None
 
         elif isinstance(label, torch.Tensor):
-            assert label.ndim == 1, ('The label shoube be in shape of (n, )'
-                                     f'but got {label.shape}.')
+            if not use_outside_embedding:
+                assert label.ndim == 1, (
+                    'The label shoube be in shape of (n, )'
+                    f'but got {label.shape}.')
             label_batch = label
         elif callable(label):
             label_generator = label
@@ -302,7 +342,10 @@ class BigGANGenerator(nn.Module):
         noise_batch = noise_batch.to(get_module_device(self))
         if label_batch is not None:
             label_batch = label_batch.to(get_module_device(self))
-            class_vector = self.shared_embedding(label_batch)
+            if not use_outside_embedding:
+                class_vector = self.shared_embedding(label_batch)
+            else:
+                class_vector = label_batch
         else:
             class_vector = None
         # If 'split noise', concat class vector and noise chunk
@@ -325,7 +368,6 @@ class BigGANGenerator(nn.Module):
         # Loop over blocks
         counter = 0
         for conv_block in self.conv_blocks:
-            # Second inner loop in case block has multiple layers
             if isinstance(conv_block, SelfAttentionBlock):
                 x = conv_block(x)
             else:
@@ -334,6 +376,9 @@ class BigGANGenerator(nn.Module):
 
         # Apply batchnorm-relu-conv-tanh at output
         out_img = torch.tanh(self.output_layer(x))
+
+        if self.rgb2bgr:
+            out_img = out_img[:, [2, 1, 0], ...]
 
         if return_noise:
             output = dict(
@@ -387,7 +432,31 @@ class BigGANGenerator(nn.Module):
 
 @MODULES.register_module()
 class BigGANDiscriminator(nn.Module):
-    """BigGAN Discriminator.
+    """BigGAN Discriminator. The implementation refers to
+    https://github.com/ajbrock/BigGAN-PyTorch/blob/master/BigGAN.py # noqa.
+
+    In BigGAN, we use a SAGAN-based architecture composing of an self-attention
+    block and number of convolutional residual blocks with spectral
+    normalization.
+
+    More details can be found in: Large Scale GAN Training for High Fidelity
+    Natural Image Synthesis (ICLR2019).
+
+    The design of the model structure is highly corresponding to the output
+    resolution. For the original BigGAN's generator, you can set ``output_scale``
+    as you need and use the default value of ``arch_cfg`` and ``blocks_cfg``.
+    If you want to customize the model, you can set the arguments in this way:
+
+    ``arch_cfg``: Config for the architecture of this generator. You can refer
+    the ``_default_arch_cfgs`` in the ``_get_default_arch_cfg`` function to see
+    the format of the ``arch_cfg``. Basically, you need to provide information
+    of each block such as the numbers of input and output channels, whether to
+    perform upsampling, etc.
+
+    ``blocks_cfg``: Config for the convolution block. You can replace the block
+    type to your registered customized block and adjust block params here.
+    However, you should notice that some params are shared among these blocks
+    like ``act_cfg``, ``with_spectral_norm``, ``sn_eps``, etc.
 
     Args:
         input_scale (int): The scale of the input image.
@@ -406,8 +475,6 @@ class BigGANDiscriminator(nn.Module):
             ortho | N02 | xavier. Defaults to 'ortho'.
         act_cfg (dict, optional): Config for the activation layer.
             Defaults to dict(type='ReLU').
-        conv_cfg (dict, optional): Config for the convolution module used in
-            this discriminator. Defaults to dict(type='Conv2d').
         with_spectral_norm (bool, optional): Whether to use spectral
             normalization. Defaults to True.
         blocks_cfg (dict, optional): Config for the convolution block.
@@ -429,7 +496,6 @@ class BigGANDiscriminator(nn.Module):
                  sn_eps=1e-6,
                  init_type='ortho',
                  act_cfg=dict(type='ReLU'),
-                 conv_cfg=dict(type='Conv2d'),
                  with_spectral_norm=True,
                  blocks_cfg=dict(type='BigGANDiscResBlock'),
                  arch_cfg=None,
@@ -445,7 +511,6 @@ class BigGANDiscriminator(nn.Module):
         self.blocks_cfg = deepcopy(blocks_cfg)
         self.blocks_cfg.update(
             dict(
-                conv_cfg=conv_cfg,
                 act_cfg=act_cfg,
                 sn_eps=sn_eps,
                 with_spectral_norm=with_spectral_norm))
