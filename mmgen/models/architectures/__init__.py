@@ -16,6 +16,7 @@ from .sngan_proj import ProjDiscriminator, SNGANGenerator
 from .stylegan import (MSStyleGAN2Discriminator, MSStyleGANv2Generator,
                        StyleGAN1Discriminator, StyleGAN2Discriminator,
                        StyleGANv1Generator, StyleGANv2Generator)
+from .stylegan_ada import ADAStyleGAN2Disc
 from .wgan_gp import WGANGPDiscriminator, WGANGPGenerator
 
 __all__ = [
@@ -31,5 +32,5 @@ __all__ = [
     'generation_init_weights', 'PatchDiscriminator', 'ResnetGenerator',
     'PerceptualLoss', 'WGANGPDiscriminator', 'WGANGPGenerator',
     'LSGANDiscriminator', 'LSGANGenerator', 'ProjDiscriminator',
-    'SNGANGenerator', 'BigGANGenerator'
+    'SNGANGenerator', 'BigGANGenerator', 'ADAStyleGAN2Disc'
 ]

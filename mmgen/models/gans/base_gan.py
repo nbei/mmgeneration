@@ -241,6 +241,9 @@ class BaseGAN(nn.Module, metaclass=ABCMeta):
             # calculated with a fixed frequency.
             elif loss_value is None:
                 continue
+            elif isinstance(loss_value, dict):
+                for k, v in loss_value.items():
+                    log_vars[f'{loss_name}/{k}'] = v
             else:
                 raise TypeError(
                     f'{loss_name} is not a tensor or list of tensors')
